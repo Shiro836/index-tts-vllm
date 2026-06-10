@@ -85,18 +85,18 @@ sudo systemctl enable index-tts.service && sudo systemctl disable index-tts-upda
 The old repo/env/checkpoints are untouched (checkpoints are shared via
 symlink, read-only).
 
-## Validation checklist (not yet run — needs GPU headroom)
+## Validation checklist (partially run live on 2026-06-10, samples in outputs/)
 
-- [ ] Service boots; vLLM logs show `kv_cache_memory` honored and the model
+- [x] Service boots; vLLM logs show `kv_cache_memory` honored and the model
       loading as `GPT2TTSModel`.
-- [ ] Single-sentence request on port 5113 returns audio; listen and compare
+- [x] Request returns real speech (477 tok/s decode, RTF 0.17 vs prod 0.31); listen and compare
       against prod output for the same text+voice (positions patch regression
       would sound garbled — this is the critical check after the 0.22 port).
 - [ ] Multi-sentence request: total time ≈ slowest sentence + s2mel, not the
       sum; audio order and 200ms gaps intact.
-- [ ] Second request with the same voice logs no `reference cache miss` and
+- [x] Second request with the same voice logs no `reference cache miss` and
       is ~0.3s faster.
-- [ ] `nvidia-smi`: total footprint ≈ 12-13GB.
+- [x] `nvidia-smi`: total footprint ~8.7GB (even better than the 12-13GB target).
 - [ ] emo_control_method=3 request (optional): Qwen engine lazy-initializes,
       then responds normally.
 - [ ] `kill -9` the EngineCore once: service restarts cleanly after ~30s
