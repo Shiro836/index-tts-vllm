@@ -1,5 +1,6 @@
 import os
 import asyncio
+import base64
 import io
 import traceback
 from fastapi import FastAPI, Request, Response, File, UploadFile, Form
@@ -85,6 +86,7 @@ async def tts_api_url(request: Request):
         emo_text = data.get("emo_text", None)
         emo_random = data.get("emo_random", False)
         max_text_tokens_per_sentence = data.get("max_text_tokens_per_sentence", 120)
+        return_segments = bool(data.get("return_segments", False))
 
         global tts
         if type(emo_control_method) is not int:
@@ -109,16 +111,30 @@ async def tts_api_url(request: Request):
             vec = None
 
         # logger.info(f"Emo control mode:{emo_control_method}, vec:{vec}")
-        sr, wav = await tts.infer(spk_audio_prompt=spk_audio_path, text=text,
+        result = await tts.infer(spk_audio_prompt=spk_audio_path, text=text,
                         output_path=None,
                         emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
                         emo_vector=vec,
                         use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
-                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence))
-        
+                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+                        return_segments=return_segments)
+        if return_segments:
+            sr, wav, segments = result
+        else:
+            sr, wav = result
+            segments = None
+
         with io.BytesIO() as wav_buffer:
             sf.write(wav_buffer, wav, sr, format='WAV')
             wav_bytes = wav_buffer.getvalue()
+
+        if return_segments:
+            # JSON response with sentence-level time marks for frontend sync
+            return JSONResponse(content={
+                "audio": base64.b64encode(wav_bytes).decode("ascii"),
+                "sampling_rate": sr,
+                "segments": segments,
+            })
 
         return Response(content=wav_bytes, media_type="audio/wav")
     

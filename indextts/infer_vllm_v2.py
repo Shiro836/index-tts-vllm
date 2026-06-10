@@ -401,7 +401,7 @@ class IndexTTS2:
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+              verbose=False, max_text_tokens_per_sentence=120, return_segments=False, **generation_kwargs):
         logger.info(">> start inference...")
         start_time = time.perf_counter()
 
@@ -492,9 +492,11 @@ class IndexTTS2:
         # concurrent requests. s2mel/vocoder for finished sentences then overlaps
         # with the decodes still in flight.
         sent_text_tokens = []
+        sent_texts = []
         for sent in sentences:
             token_ids = self.tokenizer.convert_tokens_to_ids(sent)
             sent_text_tokens.append(torch.tensor(token_ids, dtype=torch.int32, device=self.gpt_device).unsqueeze(0))
+            sent_texts.append(self.tokenizer.decode(token_ids).strip())
 
         gen_tasks = [
             asyncio.create_task(self.gpt.inference_speech(
@@ -589,8 +591,24 @@ class IndexTTS2:
             raise
         end_time = time.perf_counter()
 
+        # exact per-sentence time marks: each sentence's sample count is known,
+        # as are the silences this function inserts between them
+        segments = None
+        if return_segments:
+            sil_samples = int(sampling_rate * interval_silence / 1000.0) if interval_silence > 0 else 0
+            segments = []
+            cursor = 0
+            for sent_text, sent_wav in zip(sent_texts, wavs):
+                n = sent_wav.shape[-1]
+                segments.append({
+                    "text": sent_text,
+                    "start": round(cursor / sampling_rate, 3),
+                    "end": round((cursor + n) / sampling_rate, 3),
+                })
+                cursor += n + sil_samples
+
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
-        
+
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
         logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
@@ -617,6 +635,8 @@ class IndexTTS2:
             # 返回以符合Gradio的格式要求
             wav_data = wav.type(torch.int16)
             wav_data = wav_data.numpy().T
+            if return_segments:
+                return (sampling_rate, wav_data, segments)
             return (sampling_rate, wav_data)
 
 
