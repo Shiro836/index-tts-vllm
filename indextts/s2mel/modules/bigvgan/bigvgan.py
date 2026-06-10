@@ -418,10 +418,11 @@ class BigVGAN(
             revision: str,
             cache_dir: str,
             force_download: bool,
-            proxies: Optional[Dict],
-            resume_download: bool,
             local_files_only: bool,
             token: Union[str, bool, None],
+            # newer huggingface_hub no longer passes these two
+            proxies: Optional[Dict] = None,
+            resume_download: bool = False,
             map_location: str = "cpu",  # Additional argument
             strict: bool = False,  # Additional argument
             use_cuda_kernel: bool = False,

@@ -52,6 +52,11 @@ class GPT2TTSProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
         return {"audio": None}
 
+    # since vLLM ~0.11 the data parser is supplied by ProcessingInfo,
+    # not by the processor
+    def get_data_parser(self) -> "MultiModalDataParser":
+        return GPT2TTSDataParser()
+
 
 class GPT2TTSDummyInputsBuilder(BaseDummyInputsBuilder[GPT2TTSProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -104,9 +109,6 @@ class GPT2TTSMultiModalProcessor(BaseMultiModalProcessor[GPT2TTSProcessingInfo])
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         return _audio_field_config(hf_inputs)
-
-    def _get_data_parser(self) -> MultiModalDataParser:
-        return GPT2TTSDataParser()
 
     def _get_prompt_updates(
         self,
