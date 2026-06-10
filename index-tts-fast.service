@@ -1,0 +1,28 @@
+[Unit]
+Description=index-tts-vllm-fast API server (vLLM 0.22, port 5114)
+Wants=network-online.target
+After=network-online.target
+# start after the other GPU tenants so VRAM is in a known state at boot
+After=llm_text.service style.service
+# never give up restarting (long outages beat a dead TTS service)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=forsen
+WorkingDirectory=/home/forsen/repos/index-tts-vllm-fast
+Environment="PYTHONUNBUFFERED=1"
+# don't start until enough VRAM is actually free (boot race / previous
+# instance still releasing memory after a crash)
+ExecStartPre=/home/forsen/repos/index-tts-vllm-fast/wait_for_vram.sh 12000 300
+ExecStart=/bin/bash /home/forsen/repos/index-tts-vllm-fast/run.sh
+Restart=on-failure
+# a dying vLLM EngineCore needs several seconds to release VRAM; restarting
+# after 5s (the old setting) made the new instance race its own corpse
+RestartSec=30s
+# model load + torch.compile warmup takes minutes on cold cache
+TimeoutStartSec=900
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

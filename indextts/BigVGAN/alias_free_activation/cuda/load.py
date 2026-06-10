@@ -69,8 +69,8 @@ def load():
             ],
             extra_cuda_cflags=[
                 "-O3",
-                "-gencode",
-                "arch=compute_70,code=sm_70",
+                # compute_70 (Volta) was dropped in CUDA 13; nvcc fatals on it. The
+                # supported archs (sm_80 via cc_flag, sm_89 from torch) cover this host.
                 "--use_fast_math",
             ]
             + extra_cuda_flags
