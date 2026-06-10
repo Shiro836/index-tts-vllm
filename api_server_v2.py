@@ -28,6 +28,10 @@ async def lifespan(app: FastAPI):
         is_fp16=args.is_fp16,
         gpu_memory_utilization=args.gpu_memory_utilization,
         qwenemo_gpu_memory_utilization=args.qwenemo_gpu_memory_utilization,
+        offload_device=args.offload_device,
+        kv_cache_memory_bytes=args.kv_cache_memory_bytes,
+        qwen_emo_mode=args.qwen_emo_mode,
+        ref_device=args.ref_device,
     )
     yield
 
@@ -138,6 +142,13 @@ if __name__ == "__main__":
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.25)
     parser.add_argument("--qwenemo_gpu_memory_utilization", type=float, default=0.10)
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose mode")
+    parser.add_argument("--offload_device", type=str, default=None, help="Device to offload non-GPT models to (e.g. cuda:1)")
+    parser.add_argument("--kv_cache_memory_bytes", type=int, default=None,
+                        help="Explicit KV cache budget for the GPT engine in bytes; overrides gpu_memory_utilization and makes boot deterministic")
+    parser.add_argument("--qwen_emo_mode", type=str, default="lazy", choices=["lazy", "eager", "disabled"],
+                        help="When to build the Qwen emotion engine (~3GB VRAM, only used by emo_control_method=3)")
+    parser.add_argument("--ref_device", type=str, default=None,
+                        help="Device for reference-audio-only models (w2v-bert, campplus), e.g. 'cpu' to save ~2.5GB VRAM")
     args = parser.parse_args()
     
     if not os.path.exists("outputs"):

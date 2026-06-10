@@ -1,8 +1,10 @@
+import asyncio
 import os
 import random
 import re
 import time
 import traceback
+from collections import OrderedDict
 from typing import List
 import uuid
 
@@ -42,9 +44,25 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
+def _half_with_fp32_layernorm(model):
+    """Convert model to FP16 but keep LayerNorm in FP32 for numerical stability."""
+    model.half()
+    for module in model.modules():
+        if isinstance(module, (torch.nn.LayerNorm, torch.nn.GroupNorm)):
+            module.float()
+            module.register_forward_pre_hook(
+                lambda mod, inp: tuple(x.float() if isinstance(x, torch.Tensor) and x.is_floating_point() else x for x in inp)
+            )
+            module.register_forward_hook(
+                lambda mod, inp, out: out.half() if isinstance(out, torch.Tensor) and out.is_floating_point() else out
+            )
+    return model
+
+
 class IndexTTS2:
     def __init__(
-        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10
+        self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10, offload_device=None,
+        kv_cache_memory_bytes=None, qwen_emo_mode="lazy", ref_device=None, ref_cache_size=8,
     ):
         """
         Args:
@@ -53,6 +71,15 @@ class IndexTTS2:
             is_fp16 (bool): whether to use fp16.
             device (str): device to use (e.g., 'cuda:0', 'cpu'). If None, it will be set automatically based on the availability of CUDA or MPS.
             use_cuda_kernel (None | bool): whether to use BigVGan custom fused activation CUDA kernel, only for CUDA device.
+            kv_cache_memory_bytes (int): explicit KV-cache budget for the GPT vLLM engine. Overrides
+                gpu_memory_utilization, making the allocation independent of what else is resident on
+                the GPU at startup (avoids boot-order races between services).
+            qwen_emo_mode (str): "lazy" (default) builds the Qwen emotion engine on first emo-text
+                request, "eager" builds it at startup, "disabled" never builds it.
+            ref_device (str): device for the reference-audio-only models (w2v-bert, campplus).
+                E.g. "cpu" keeps ~2.5GB off the GPU; with the reference cache the forward only
+                runs once per new speaker.
+            ref_cache_size (int): number of reference audio files whose conditioning is kept cached.
         """
         if device is not None:
             self.device = device
@@ -72,6 +99,12 @@ class IndexTTS2:
             self.use_cuda_kernel = False
             logger.info(">> Be patient, it may take a while to run in CPU mode.")
 
+        if offload_device:
+            self.gpt_device = self.device
+            self.device = offload_device
+        else:
+            self.gpt_device = self.device
+
         cfg_path = os.path.join(model_dir, "config.yaml")
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
@@ -79,28 +112,51 @@ class IndexTTS2:
         self.stop_mel_token = self.cfg.gpt.stop_mel_token
 
         vllm_dir = os.path.join(model_dir, "gpt")
-        engine_args = AsyncEngineArgs(
+        engine_kwargs = dict(
             model=vllm_dir,
             tensor_parallel_size=1,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
-            # enforce_eager=True,
+            # prompts carry unique per-request conditioning embeds, so block-level
+            # prefix caching can never hit; it only adds mm-hashing overhead
+            enable_prefix_caching=False,
+            max_num_seqs=16,
+            # vLLM >= 0.11 rejects multimodal *embedding* inputs (our conditioning
+            # prompt) unless explicitly enabled
+            enable_mm_embeds=True,
+            # every request's embeds are unique; caching processed mm items only
+            # burns CPU RAM on dead entries
+            mm_processor_cache_gb=0,
         )
+        if kv_cache_memory_bytes:
+            engine_kwargs["kv_cache_memory_bytes"] = int(kv_cache_memory_bytes)
+        try:
+            from vllm.config import CompilationConfig
+            # decode batch is tiny (concurrent sentences); capturing graphs up to
+            # the default 256 wastes several hundred MB of VRAM
+            engine_kwargs["compilation_config"] = CompilationConfig(cudagraph_capture_sizes=[1, 2, 4, 8, 16])
+        except Exception:
+            logger.warning(">> CompilationConfig unavailable; using default cudagraph capture sizes")
+        engine_args = AsyncEngineArgs(**engine_kwargs)
         indextts_vllm = AsyncLLM.from_engine_args(engine_args)
 
-        self.qwen_emo = QwenEmotion(
-            os.path.join(self.model_dir, self.cfg.qwen_emo_path),
-            gpu_memory_utilization=qwenemo_gpu_memory_utilization,
-        )
+        self.qwen_emo = None
+        self.qwen_emo_mode = qwen_emo_mode
+        self._qwen_emo_dir = os.path.join(self.model_dir, self.cfg.qwen_emo_path)
+        self._qwen_emo_gpu_memory_utilization = qwenemo_gpu_memory_utilization
+        self._qwen_emo_lock = asyncio.Lock()
+        if qwen_emo_mode == "eager":
+            self.qwen_emo = QwenEmotion(
+                self._qwen_emo_dir,
+                gpu_memory_utilization=qwenemo_gpu_memory_utilization,
+            )
 
         self.gpt = UnifiedVoice(indextts_vllm, **self.cfg.gpt)
         self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
         load_checkpoint(self.gpt, self.gpt_path)
-        self.gpt = self.gpt.to(self.device)
-        # if self.is_fp16:
-        #     self.gpt.eval().half()
-        # else:
-        #     self.gpt.eval()
+        self.gpt = self.gpt.to(self.gpt_device)
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.gpt)
         self.gpt.eval()
         logger.info(f">> GPT weights restored from: {self.gpt_path}")
 
@@ -124,15 +180,20 @@ class IndexTTS2:
             os.path.join(self.model_dir, self.cfg.w2v_stat),
             os.path.join(self.model_dir, "w2v-bert-2.0")
         )
-        self.semantic_model = self.semantic_model.to(self.device)
+        self.ref_device = ref_device or self.device
+        self.semantic_model = self.semantic_model.to(self.ref_device)
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.semantic_model)
         self.semantic_model.eval()
-        self.semantic_mean = self.semantic_mean.to(self.device)
-        self.semantic_std = self.semantic_std.to(self.device)
+        self.semantic_mean = self.semantic_mean.to(self.ref_device)
+        self.semantic_std = self.semantic_std.to(self.ref_device)
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
         semantic_code_ckpt = os.path.join(self.model_dir, "semantic_codec/model.safetensors")
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         self.semantic_codec = semantic_codec.to(self.device)
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.semantic_codec)
         self.semantic_codec.eval()
         logger.info('>> semantic_codec weights restored from: {}'.format(semantic_code_ckpt))
 
@@ -147,7 +208,11 @@ class IndexTTS2:
             is_distributed=False,
         )
         self.s2mel = s2mel.to(self.device)
-        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.s2mel)
+        # real upper bound is prompt_condition + 1.72 * codes ≈ 2.4k positions at the
+        # 120-token sentence cap; 8192 wasted a few hundred MB of preallocated cache
+        self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=4096)
         self.s2mel.eval()
         logger.info(f">> s2mel weights restored from: {s2mel_path}")
 
@@ -158,7 +223,9 @@ class IndexTTS2:
         campplus_ckpt_path = os.path.join(self.model_dir, "campplus/campplus_cn_common.bin")
         campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
-        self.campplus_model = campplus_model.to(self.device)
+        self.campplus_model = campplus_model.to(self.ref_device)
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.campplus_model)
         self.campplus_model.eval()
         logger.info(f">> campplus_model weights restored from: {campplus_ckpt_path}")
 
@@ -167,6 +234,8 @@ class IndexTTS2:
         self.bigvgan = bigvgan.BigVGAN.from_pretrained(os.path.join(self.model_dir, "bigvgan"))
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
+        if self.is_fp16:
+            _half_with_fp32_layernorm(self.bigvgan)
         self.bigvgan.eval()
         logger.info(f">> bigvgan weights restored from: {bigvgan_name}")
 
@@ -199,7 +268,31 @@ class IndexTTS2:
         }
         self.mel_fn = lambda x: mel_spectrogram(x, **mel_fn_args)
 
-        self.speaker_dict = {}
+        # LRU cache of everything derived from a reference wav (w2v-bert embedding,
+        # s2mel prompt condition, campplus style, GPT conditioning latent). All of it
+        # is a pure function of the audio file, so it only needs to be computed once
+        # per speaker instead of on every request.
+        self._ref_cache = OrderedDict()
+        self._ref_cache_size = ref_cache_size
+
+    async def _ensure_qwen_emo(self):
+        if self.qwen_emo is not None:
+            return self.qwen_emo
+        if self.qwen_emo_mode == "disabled":
+            raise RuntimeError(
+                "emo_text mode requested but the Qwen emotion engine is disabled "
+                "(qwen_emo_mode='disabled'); pass an explicit emotion vector instead"
+            )
+        async with self._qwen_emo_lock:
+            if self.qwen_emo is None:
+                logger.info(">> lazily initializing Qwen emotion engine (first emo-text request)...")
+                stt = time.perf_counter()
+                self.qwen_emo = QwenEmotion(
+                    self._qwen_emo_dir,
+                    gpu_memory_utilization=self._qwen_emo_gpu_memory_utilization,
+                )
+                logger.info(f">> Qwen emotion engine ready in {time.perf_counter() - stt:.1f}s")
+        return self.qwen_emo
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
@@ -210,7 +303,76 @@ class IndexTTS2:
         )
         feat = vq_emb.hidden_states[17]  # (B, T, C)
         feat = (feat - self.semantic_mean) / self.semantic_std
+        if self.dtype is not None:
+            feat = feat.to(self.dtype)
         return feat
+
+    @staticmethod
+    def _ref_cache_key(audio_path):
+        st = os.stat(audio_path)
+        return (os.path.abspath(audio_path), st.st_mtime_ns, st.st_size)
+
+    @torch.no_grad()
+    def _compute_ref(self, audio_path):
+        """Compute all conditioning derived from a reference wav (the per-speaker,
+        per-request-invariant part of the old infer() preamble)."""
+        audio, sr = librosa.load(audio_path)
+        audio = torch.tensor(audio).unsqueeze(0)
+        audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
+        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
+
+        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs["input_features"].to(self.ref_device)
+        attention_mask = inputs["attention_mask"].to(self.ref_device)
+        spk_cond_emb = self.get_emb(input_features, attention_mask).to(self.device)
+        spk_cond_emb_gpt = spk_cond_emb.to(self.gpt_device)
+
+        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
+        ref_mel = self.mel_fn(audio_22k.to(self.device).float())
+        if self.dtype is not None:
+            ref_mel = ref_mel.to(self.dtype)
+        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+        feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(self.ref_device),
+                                                 num_mel_bins=80,
+                                                 dither=0,
+                                                 sample_frequency=16000)
+        feat = feat - feat.mean(dim=0, keepdim=True)
+        if self.dtype is not None:
+            feat = feat.to(self.dtype)
+        style = self.campplus_model(feat.unsqueeze(0)).to(self.device)
+
+        prompt_condition = self.s2mel.models['length_regulator'](S_ref,
+                                                                 ylens=ref_target_lengths,
+                                                                 n_quantizers=3,
+                                                                 f0=None)[0]
+
+        # GPT conditioning latent (was recomputed inside inference_speech per sentence).
+        # Length semantics (shape[-1]) intentionally match the original call sites.
+        cond_lengths_gpt = torch.tensor([spk_cond_emb.shape[-1]], device=self.gpt_device)
+        cond_latent = self.gpt.get_conditioning(spk_cond_emb_gpt.transpose(1, 2), cond_lengths_gpt)
+
+        return {
+            "spk_cond_emb": spk_cond_emb,
+            "spk_cond_emb_gpt": spk_cond_emb_gpt,
+            "prompt_condition": prompt_condition,
+            "ref_mel": ref_mel,
+            "style": style,
+            "cond_latent": cond_latent,
+        }
+
+    def _get_ref(self, audio_path):
+        key = self._ref_cache_key(audio_path)
+        entry = self._ref_cache.get(key)
+        if entry is None:
+            stt = time.perf_counter()
+            entry = self._compute_ref(audio_path)
+            self._ref_cache[key] = entry
+            while len(self._ref_cache) > self._ref_cache_size:
+                self._ref_cache.popitem(last=False)
+            logger.info(f">> reference cache miss for {audio_path} (computed in {time.perf_counter() - stt:.2f}s)")
+        else:
+            self._ref_cache.move_to_end(key)
+        return entry
 
     def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
         """
@@ -250,7 +412,8 @@ class IndexTTS2:
             # assert emo_alpha == 1.0
             if emo_text is None:
                 emo_text = text
-            emo_dict, content = await self.qwen_emo.inference(emo_text)
+            qwen_emo = await self._ensure_qwen_emo()
+            emo_dict, content = await qwen_emo.inference(emo_text)
             # logger.info(emo_dict)
             emo_vector = list(emo_dict.values())
 
@@ -265,32 +428,12 @@ class IndexTTS2:
             emo_alpha = 1.0
             # assert emo_alpha == 1.0
 
-        audio, sr = librosa.load(spk_audio_prompt)
-        audio = torch.tensor(audio).unsqueeze(0)
-        audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
-        audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
-
-        inputs = self.extract_features(audio_16k, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs["input_features"]
-        attention_mask = inputs["attention_mask"]
-        input_features = input_features.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-        spk_cond_emb = self.get_emb(input_features, attention_mask)
-
-        _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-        ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
-        ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
-        feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
-                                                    num_mel_bins=80,
-                                                    dither=0,
-                                                    sample_frequency=16000)
-        feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
-        style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
-
-        prompt_condition = self.s2mel.models['length_regulator'](S_ref,
-                                                                    ylens=ref_target_lengths,
-                                                                    n_quantizers=3,
-                                                                    f0=None)[0]
+        spk_ref = self._get_ref(spk_audio_prompt)
+        spk_cond_emb = spk_ref["spk_cond_emb"]
+        spk_cond_emb_gpt = spk_ref["spk_cond_emb_gpt"]
+        prompt_condition = spk_ref["prompt_condition"]
+        ref_mel = spk_ref["ref_mel"]
+        style = spk_ref["style"]
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector).to(self.device)
@@ -305,13 +448,11 @@ class IndexTTS2:
             emovec_mat = torch.sum(emovec_mat, 0)
             emovec_mat = emovec_mat.unsqueeze(0)
 
-        emo_audio, _ = librosa.load(emo_audio_prompt, sr=16000)
-        emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-        emo_input_features = emo_inputs["input_features"]
-        emo_attention_mask = emo_inputs["attention_mask"]
-        emo_input_features = emo_input_features.to(self.device)
-        emo_attention_mask = emo_attention_mask.to(self.device)
-        emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+        # the emo reference defaults to the speaker wav, in which case the speaker
+        # entry is reused instead of running w2v-bert a second time on the same audio
+        emo_ref = spk_ref if emo_audio_prompt == spk_audio_prompt else self._get_ref(emo_audio_prompt)
+        emo_cond_emb = emo_ref["spk_cond_emb"]
+        emo_cond_emb_gpt = emo_ref["spk_cond_emb_gpt"]
 
         text_tokens_list = self.tokenizer.tokenize(text)
         sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
@@ -328,127 +469,124 @@ class IndexTTS2:
         gpt_forward_time = 0
         s2mel_time = 0
         bigvgan_time = 0
-        has_warned = False
+
+        # request-invariant conditioning, hoisted out of the sentence loop
+        # (the old code recomputed it per sentence with identical inputs)
+        cond_lengths = torch.tensor([spk_cond_emb.shape[-1]], device=self.gpt_device)
+        emo_cond_lengths = torch.tensor([emo_cond_emb.shape[-1]], device=self.gpt_device)
+        with torch.no_grad():
+            emovec = self.gpt.merge_emovec(
+                spk_cond_emb_gpt,
+                emo_cond_emb_gpt,
+                cond_lengths,
+                emo_cond_lengths,
+                alpha=emo_alpha
+            )
+
+            if emo_vector is not None:
+                emovec = emovec_mat.to(self.gpt_device) + (1 - torch.sum(weight_vector.to(self.gpt_device))) * emovec
+                # emovec = emovec_mat
+
+        # launch every sentence's GPT decode at once — sentences are conditioned
+        # only on the reference audio, not on each other, and vLLM batches the
+        # concurrent requests. s2mel/vocoder for finished sentences then overlaps
+        # with the decodes still in flight.
+        sent_text_tokens = []
         for sent in sentences:
-            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
-            text_tokens = torch.tensor(text_tokens, dtype=torch.int32, device=self.device).unsqueeze(0)
+            token_ids = self.tokenizer.convert_tokens_to_ids(sent)
+            sent_text_tokens.append(torch.tensor(token_ids, dtype=torch.int32, device=self.gpt_device).unsqueeze(0))
 
-            if verbose:
-                print(text_tokens)
-                print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
-                # debug tokenizer
-                text_token_syms = self.tokenizer.convert_ids_to_tokens(text_tokens[0].tolist())
-                print("text_token_syms is same as sentence tokens", text_token_syms == sent)
+        gen_tasks = [
+            asyncio.create_task(self.gpt.inference_speech(
+                spk_cond_emb_gpt,
+                text_tokens,
+                emo_cond_emb_gpt,
+                cond_lengths=cond_lengths,
+                emo_cond_lengths=emo_cond_lengths,
+                emo_vec=emovec,
+                speech_conditioning_latent=spk_ref["cond_latent"],
+            ))
+            for text_tokens in sent_text_tokens
+        ]
 
-            m_start_time = time.perf_counter()
-            with torch.no_grad():
-                emovec = self.gpt.merge_emovec(
-                    spk_cond_emb,
-                    emo_cond_emb,
-                    torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                    torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    alpha=emo_alpha
-                )
-
-                if emo_vector is not None:
-                    emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
-                    # emovec = emovec_mat
-
-                codes, speech_conditioning_latent = await self.gpt.inference_speech(
-                    spk_cond_emb,
-                    text_tokens,
-                    emo_cond_emb,
-                    cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_vec=emovec,
-                )
-                gpt_gen_time += time.perf_counter() - m_start_time
-                # if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                #     warnings.warn(
-                #         f"WARN: generation stopped due to exceeding `max_mel_tokens` ({self.cfg.gpt.max_mel_tokens}). "
-                #         f"Current output shape: {codes.shape}. "
-                #         f"Input text tokens: {text_tokens.shape[1]}. "
-                #         f"Consider reducing `max_text_tokens_per_sentence`({max_text_tokens_per_sentence}) or increasing `max_mel_tokens`.",
-                #         category=RuntimeWarning
-                #     )
-                #     has_warned = True
-
-                # codes = torch.tensor(codes, dtype=torch.long, device=self.device).unsqueeze(0)
-                code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
-
-                code_lens = []
-                for code in codes:
-                    if self.stop_mel_token not in code:
-                        # code_lens.append(len(code))
-                        code_len = len(code)
-                    else:
-                        len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                        code_len = len_ - 1
-                    code_lens.append(code_len)
-                codes = codes[:, :code_len]
-                code_lens = torch.LongTensor(code_lens)
-                code_lens = code_lens.to(self.device)
-                if verbose:
-                    print(codes, type(codes))
-                    print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                    print(f"code len: {code_lens}")
-
+        try:
+            for text_tokens, gen_task in zip(sent_text_tokens, gen_tasks):
                 m_start_time = time.perf_counter()
-                use_speed = torch.zeros(spk_cond_emb.size(0)).to(spk_cond_emb.device).long()
-                # latent = self.gpt(speech_conditioning_latent, text_tokens,
-                #                 torch.tensor([text_tokens.shape[-1]], device=text_tokens.device), codes,
-                #                 code_lens*self.gpt.mel_length_compression,
-                #                 cond_mel_lengths=torch.tensor([speech_conditioning_latent.shape[-1]], device=text_tokens.device),
-                #                 return_latent=True, clip_inputs=False)
-                latent = self.gpt(
-                    speech_conditioning_latent,
-                    text_tokens,
-                    torch.tensor([text_tokens.shape[-1]], device=text_tokens.device),
-                    codes,
-                    torch.tensor([codes.shape[-1]], device=text_tokens.device),
-                    emo_cond_emb,
-                    cond_mel_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_cond_mel_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
-                    emo_vec=emovec,
-                    use_speed=use_speed,
-                )
-                gpt_forward_time += time.perf_counter() - m_start_time
+                codes, speech_conditioning_latent = await gen_task
+                gpt_gen_time += time.perf_counter() - m_start_time
 
-                dtype = None
-                with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
-                    m_start_time = time.perf_counter()
-                    diffusion_steps = 25
-                    inference_cfg_rate = 0.7
-                    latent = self.s2mel.models['gpt_layer'](latent)
-                    S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
-                    S_infer = S_infer.transpose(1, 2)
-                    S_infer = S_infer + latent
-                    target_lengths = (code_lens * 1.72).long()
-
-                    cond = self.s2mel.models['length_regulator'](S_infer,
-                                                                 ylens=target_lengths,
-                                                                 n_quantizers=3,
-                                                                 f0=None)[0]
-                    cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                    vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                                   torch.LongTensor([cat_condition.size(1)]).to(
-                                                                       cond.device),
-                                                                   ref_mel, style, None, diffusion_steps,
-                                                                   inference_cfg_rate=inference_cfg_rate)
-                    vc_target = vc_target[:, :, ref_mel.size(-1):]
-                    s2mel_time += time.perf_counter() - m_start_time
+                with torch.no_grad():
+                    code_lens = []
+                    for code in codes:
+                        if self.stop_mel_token not in code:
+                            code_len = len(code)
+                        else:
+                            len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
+                            code_len = len_ - 1
+                        code_lens.append(code_len)
+                    codes = codes[:, :code_len]
+                    code_lens = torch.LongTensor(code_lens)
+                    code_lens = code_lens.to(self.device)
+                    if verbose:
+                        print(codes, type(codes))
+                        print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
+                        print(f"code len: {code_lens}")
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
-                    bigvgan_time += time.perf_counter() - m_start_time
-                    wav = wav.squeeze(1)
+                    use_speed = torch.zeros(spk_cond_emb.size(0)).to(self.gpt_device).long()
+                    latent = self.gpt(
+                        speech_conditioning_latent,
+                        text_tokens,
+                        torch.tensor([text_tokens.shape[-1]], device=self.gpt_device),
+                        codes,
+                        torch.tensor([codes.shape[-1]], device=self.gpt_device),
+                        emo_cond_emb_gpt,
+                        cond_mel_lengths=cond_lengths,
+                        emo_cond_mel_lengths=emo_cond_lengths,
+                        emo_vec=emovec,
+                        use_speed=use_speed,
+                    )
+                    gpt_forward_time += time.perf_counter() - m_start_time
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                if verbose:
-                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                # wavs.append(wav[:, :-512])
-                # logger.error(f"time per token: {wav.shape[-1] / sampling_rate / codes.shape[-1]}, {wav.shape[-1] / sampling_rate / vc_target.shape[-1]}")
-                wavs.append(wav.cpu())  # to cpu before saving
+                    latent = latent.to(self.device)
+                    codes = codes.to(self.device)
+
+                    with torch.amp.autocast(self.device.split(":")[0] if isinstance(self.device, str) else self.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                        m_start_time = time.perf_counter()
+                        diffusion_steps = 25
+                        inference_cfg_rate = 0.7
+                        latent = self.s2mel.models['gpt_layer'](latent)
+                        S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+                        S_infer = S_infer.transpose(1, 2)
+                        S_infer = S_infer + latent
+                        target_lengths = (code_lens * 1.72).long()
+
+                        cond = self.s2mel.models['length_regulator'](S_infer,
+                                                                     ylens=target_lengths,
+                                                                     n_quantizers=3,
+                                                                     f0=None)[0]
+                        cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                        vc_target = self.s2mel.models['cfm'].inference(cat_condition,
+                                                                       torch.LongTensor([cat_condition.size(1)]).to(
+                                                                           cond.device),
+                                                                       ref_mel, style, None, diffusion_steps,
+                                                                       inference_cfg_rate=inference_cfg_rate)
+                        vc_target = vc_target[:, :, ref_mel.size(-1):]
+                        s2mel_time += time.perf_counter() - m_start_time
+
+                        m_start_time = time.perf_counter()
+                        wav = self.bigvgan(vc_target).squeeze().unsqueeze(0)
+                        bigvgan_time += time.perf_counter() - m_start_time
+                        wav = wav.squeeze(1)
+
+                    wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                    if verbose:
+                        print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+                    wavs.append(wav.cpu())  # to cpu before saving
+        except BaseException:
+            for task in gen_tasks:
+                task.cancel()
+            raise
         end_time = time.perf_counter()
 
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
@@ -491,16 +629,13 @@ def find_most_similar_cosine(query_vector, matrix):
     return most_similar_index
 
 class QwenEmotion:
-    def __init__(self, model_dir, gpu_memory_utilization=0.1):
+    def __init__(self, model_dir, gpu_memory_utilization=0.1, device_id=None):
         self.model_dir = model_dir
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
 
-        # self.model = AutoModelForCausalLM.from_pretrained(
-        #     self.model_dir,
-        #     torch_dtype="float16",  # "auto"
-        #     # device_map="auto"
-        # )
-        # self.model = self.model.to("cuda")
+        env_backup = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if device_id is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_id)
 
         engine_args = AsyncEngineArgs(
             model=model_dir,
@@ -510,6 +645,12 @@ class QwenEmotion:
             max_model_len=2048,
         )
         self.model = AsyncLLM.from_engine_args(engine_args)
+
+        if device_id is not None:
+            if env_backup is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = env_backup
+            else:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
         self.prompt = "文本情感分类"
         self.convert_dict = {

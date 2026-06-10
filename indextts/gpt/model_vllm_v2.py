@@ -18,7 +18,8 @@ from indextts.gpt.perceiver import PerceiverResampler
 
 from indextts.gpt.index_tts_gpt2_vllm_v1 import PLACEHOLDER_TOKEN, PLACEHOLDER_TOKEN_ID
 
-from vllm import AsyncLLMEngine, SamplingParams, TokensPrompt
+from vllm import SamplingParams, TokensPrompt
+from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
 
 
@@ -153,6 +154,9 @@ class UnifiedVoice(nn.Module):
             max_tokens=2048,  # 605
             stop_token_ids=[self.stop_mel_token],
             include_stop_str_in_output=True,
+            # only the finished output is consumed; skip per-token streaming
+            # through the asyncio frontend
+            output_kind=RequestOutputKind.FINAL_ONLY,
         )
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
@@ -202,7 +206,7 @@ class UnifiedVoice(nn.Module):
         conds = self.emo_perceiver_encoder(speech_conditioning_input, conds_mask)  # (b, 1, d)
         return conds.squeeze(1)
 
-    async def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False):
+    async def inference_speech(self, speech_condition, text_inputs, emo_speech_condition=None, cond_lengths=None, emo_cond_lengths=None, emo_vec=None, use_speed=False, speech_conditioning_latent=None):
         if speech_condition.ndim == 2:
             speech_condition = speech_condition.unsqueeze(0)
         if emo_speech_condition is None:
@@ -210,16 +214,15 @@ class UnifiedVoice(nn.Module):
         if cond_lengths is None:
             cond_lengths = torch.tensor([speech_condition.shape[-1]], device=speech_condition.device)
         if emo_cond_lengths is None:
-            emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device) 
+            emo_cond_lengths = torch.tensor([emo_speech_condition.shape[-1]], device=speech_condition.device)
 
-        speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
+        if speech_conditioning_latent is None:
+            speech_conditioning_latent = self.get_conditioning(speech_condition.transpose(1,2), cond_lengths)
         if emo_vec is None:
             logger.info('compute emo vec')
             emo_vec = self.get_emo_conditioning(emo_speech_condition.transpose(1,2), emo_cond_lengths)
             emo_vec = self.emovec_layer(emo_vec)
             emo_vec = self.emo_layer(emo_vec)
-        else:
-            logger.info('Use the specified emotion vector')
 
         tmp = torch.zeros(text_inputs.size(0)).to(text_inputs.device)
         duration_emb =  self.speed_emb(torch.zeros_like(tmp).long())
@@ -242,13 +245,12 @@ class UnifiedVoice(nn.Module):
         request_id = uuid.uuid4().hex
         output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id)
         gpt_stt = time.time()
-        prefill_flag = True
+        output = None
         async for output in output_generator:
-            if prefill_flag:
-                logger.info(f"[{request_id}] [prefill time: {(time.time() - gpt_stt):.4f}]")
-                gpt_stt = time.time()
-                prefill_flag = False
-        logger.info(f"[{request_id}] [decode time: {(time.time() - gpt_stt):.4f}] [decode len: {len(output.outputs[0].token_ids)}]")
+            pass
+        gen_len = len(output.outputs[0].token_ids)
+        gen_time = time.time() - gpt_stt
+        logger.info(f"[{request_id}] [gen time: {gen_time:.4f}] [gen len: {gen_len}] [tok/s: {gen_len / max(gen_time, 1e-6):.1f}]")
         codes = output.outputs[0].token_ids[:-2]
         codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
 
