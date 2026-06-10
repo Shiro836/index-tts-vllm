@@ -23,7 +23,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 LD_PRELOAD=/home/forsen/repos/index-tts-vllm-fast/fake_dns.so \
     /home/forsen/miniconda3/envs/index-tts-vllm-fast/bin/python api_server_v2.py \
     --host 0.0.0.0 \
-    --port 5114 \
+    --port 5113 \
     --gpu_memory_utilization 0.10 \
     --kv_cache_memory_bytes 2500000000 \
     --qwen_emo_mode lazy \

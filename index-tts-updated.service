@@ -1,9 +1,12 @@
 [Unit]
-Description=index-tts-vllm-fast API server (vLLM 0.22, port 5114)
+Description=index-tts-updated API server (vLLM 0.22, drop-in for index-tts on port 5113)
 Wants=network-online.target
 After=network-online.target
 # start after the other GPU tenants so VRAM is in a known state at boot
 After=llm_text.service style.service
+# drop-in replacement: same port as index-tts.service — starting this unit
+# automatically stops the old one (and vice versa), so toggling is one command
+Conflicts=index-tts.service
 # never give up restarting (long outages beat a dead TTS service)
 StartLimitIntervalSec=0
 

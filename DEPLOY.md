@@ -2,8 +2,10 @@
 
 Fork of `index-tts-vllm` focused on inference latency, VRAM footprint and boot
 reliability. Runs on **vLLM 0.22.1** (was 0.10.2) in its own conda env
-(`index-tts-vllm-fast`), on **port 5114**, fully side-by-side deployable with
-the existing `index-tts.service` (port 5113).
+(`index-tts-vllm-fast`). Drop-in replacement for `index-tts.service` on the
+**same port 5113** — the unit has `Conflicts=index-tts.service`, so starting
+either service automatically stops the other; switching back and forth is a
+single systemctl command and no consumer needs to change.
 
 ## What changed vs the original
 
@@ -34,7 +36,7 @@ VRAM (target ~12-13GB total vs ~22.8GB):
   `expandable_segments` allocator. −1GB-ish.
 
 Boot reliability:
-- `index-tts-fast.service`: starts after the other GPU services
+- `index-tts-updated.service`: starts after the other GPU services
   (`llm_text.service`, `style.service`), `ExecStartPre=wait_for_vram.sh`
   blocks until enough VRAM is actually free, `RestartSec=30s` (a dying
   EngineCore needs seconds to release VRAM; the old 5s raced it),
@@ -59,30 +61,35 @@ vLLM port notes:
 # 0) build fake_dns.so if missing (it is not committed)
 gcc -shared -fPIC fake_dns.c -o fake_dns.so -ldl
 
-# 1) install the unit (do NOT enable the old and new one for the same port)
-sudo cp index-tts-fast.service /etc/systemd/system/
+# 1) install the unit
+sudo cp index-tts-updated.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-# 2) free VRAM by stopping the old service, then start the new one
-sudo systemctl stop index-tts.service
-sudo systemctl start index-tts-fast.service
-journalctl -u index-tts-fast.service -f
+# 2) switch over (Conflicts= stops the old service automatically)
+sudo systemctl start index-tts-updated.service
+journalctl -u index-tts-updated.service -f
 
-# 3) validate (see checklist below), then flip the consumer to port 5114
-#    and disable the old unit
+# 3) once validated, make it the boot default
 sudo systemctl disable index-tts.service
-sudo systemctl enable index-tts-fast.service
+sudo systemctl enable index-tts-updated.service
 ```
 
-Rollback: `systemctl stop index-tts-fast && systemctl start index-tts` — the
-old repo/env/checkpoints are untouched (checkpoints are shared via symlink,
-read-only).
+Rollback (one command, the Conflicts= relation stops the new one for you):
+
+```bash
+sudo systemctl start index-tts.service
+# and if it should stay that way across reboots:
+sudo systemctl enable index-tts.service && sudo systemctl disable index-tts-updated.service
+```
+
+The old repo/env/checkpoints are untouched (checkpoints are shared via
+symlink, read-only).
 
 ## Validation checklist (not yet run — needs GPU headroom)
 
 - [ ] Service boots; vLLM logs show `kv_cache_memory` honored and the model
       loading as `GPT2TTSModel`.
-- [ ] Single-sentence request on port 5114 returns audio; listen and compare
+- [ ] Single-sentence request on port 5113 returns audio; listen and compare
       against prod output for the same text+voice (positions patch regression
       would sound garbled — this is the critical check after the 0.22 port).
 - [ ] Multi-sentence request: total time ≈ slowest sentence + s2mel, not the
