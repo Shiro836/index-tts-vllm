@@ -101,3 +101,21 @@ symlink, read-only).
       then responds normally.
 - [ ] `kill -9` the EngineCore once: service restarts cleanly after ~30s
       without manual help.
+
+## Streaming endpoint
+
+`POST /tts_stream` — same request fields as `/tts_url`. Responds with NDJSON,
+one line per finished sentence chunk:
+
+```json
+{"text": "...", "start": 0.0, "end": 4.34, "sampling_rate": 22050, "audio": "<b64 standalone wav>"}
+```
+
+terminated by `{"done": true}` (or `{"error": "..."}` on mid-stream failure —
+the HTTP status is already 200 by then, so consumers must check for it).
+Chunks include the 200ms inter-sentence silence; decoding and concatenating
+all chunks reproduces the `/tts_url` output exactly. `start`/`end` bound the
+speech within the concatenated stream (silence excluded). First chunk arrives
+after the first sentence is synthesized (~1.3s) while the rest keep decoding;
+lower `max_text_tokens_per_sentence` for finer chunks / faster first audio.
+Client disconnect aborts the in-flight vLLM decodes.

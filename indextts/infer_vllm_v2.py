@@ -407,11 +407,24 @@ class IndexTTS2:
 
         return wavs_list
     
-    async def infer(self, spk_audio_prompt, text, output_path,
+    async def infer_stream(self, spk_audio_prompt, text,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_sentence=120, return_segments=False, **generation_kwargs):
+              verbose=False, max_text_tokens_per_sentence=120, **generation_kwargs):
+        """Async generator yielding one finished sentence chunk at a time:
+
+            (segment, sampling_rate, chunk)
+
+        - segment: {"text", "start", "end"} — positions in the concatenated
+          stream; start/end bound the speech itself, excluding the
+          inter-sentence silence that is appended to every non-final chunk.
+        - chunk: float tensor [1, N] scaled to ±32767; concatenating all
+          chunks reproduces exactly what infer() returns.
+
+        First chunk is ready after one sentence is synthesized, while the
+        remaining sentences keep decoding in vLLM concurrently.
+        """
         logger.info(">> start inference...")
         start_time = time.perf_counter()
 
@@ -474,7 +487,6 @@ class IndexTTS2:
 
         sampling_rate = 22050
 
-        wavs = []
         gpt_gen_time = 0
         gpt_forward_time = 0
         s2mel_time = 0
@@ -521,8 +533,13 @@ class IndexTTS2:
             for text_tokens in sent_text_tokens
         ]
 
+        sil_samples = int(sampling_rate * interval_silence / 1000.0) if interval_silence > 0 else 0
+        sil_tensor = torch.zeros(1, sil_samples)
+        cursor = 0
+        total_audio_samples = 0
+
         try:
-            for text_tokens, gen_task in zip(sent_text_tokens, gen_tasks):
+            for sent_idx, (sent_text, text_tokens, gen_task) in enumerate(zip(sent_texts, sent_text_tokens, gen_tasks)):
                 m_start_time = time.perf_counter()
                 codes, speech_conditioning_latent = await gen_task
                 gpt_gen_time += time.perf_counter() - m_start_time
@@ -594,33 +611,29 @@ class IndexTTS2:
                     wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                     if verbose:
                         print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                    wavs.append(wav.cpu())  # to cpu before saving
+                    wav = wav.cpu()
+
+                n = wav.shape[-1]
+                segment = {
+                    "text": sent_text,
+                    "start": round(cursor / sampling_rate, 3),
+                    "end": round((cursor + n) / sampling_rate, 3),
+                }
+                is_last = sent_idx == len(gen_tasks) - 1
+                chunk = wav if (is_last or sil_samples == 0) else torch.cat([wav, sil_tensor], dim=1)
+                cursor += chunk.shape[-1]
+                total_audio_samples += chunk.shape[-1]
+
+                yield segment, sampling_rate, chunk
         except BaseException:
+            # also covers GeneratorExit when the consumer disconnects mid-stream:
+            # abort the decodes still running in vLLM
             for task in gen_tasks:
                 task.cancel()
             raise
         end_time = time.perf_counter()
 
-        # exact per-sentence time marks: each sentence's sample count is known,
-        # as are the silences this function inserts between them
-        segments = None
-        if return_segments:
-            sil_samples = int(sampling_rate * interval_silence / 1000.0) if interval_silence > 0 else 0
-            segments = []
-            cursor = 0
-            for sent_text, sent_wav in zip(sent_texts, wavs):
-                n = sent_wav.shape[-1]
-                segments.append({
-                    "text": sent_text,
-                    "start": round(cursor / sampling_rate, 3),
-                    "end": round((cursor + n) / sampling_rate, 3),
-                })
-                cursor += n + sil_samples
-
-        wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
-
-        wav = torch.cat(wavs, dim=1)
-        wav_length = wav.shape[-1] / sampling_rate
+        wav_length = total_audio_samples / sampling_rate
         logger.info(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
         logger.info(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
         logger.info(f">> s2mel_time: {s2mel_time:.2f} seconds")
@@ -628,6 +641,29 @@ class IndexTTS2:
         logger.info(f">> Total inference time: {end_time - start_time:.2f} seconds")
         logger.info(f">> Generated audio length: {wav_length:.2f} seconds")
         logger.info(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+
+    async def infer(self, spk_audio_prompt, text, output_path,
+              emo_audio_prompt=None, emo_alpha=1.0,
+              emo_vector=None,
+              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+              verbose=False, max_text_tokens_per_sentence=120, return_segments=False, **generation_kwargs):
+        wavs = []
+        segments = []
+        sampling_rate = 22050
+
+        async for segment, sampling_rate, chunk in self.infer_stream(
+            spk_audio_prompt, text,
+            emo_audio_prompt=emo_audio_prompt, emo_alpha=emo_alpha,
+            emo_vector=emo_vector,
+            use_emo_text=use_emo_text, emo_text=emo_text, use_random=use_random,
+            interval_silence=interval_silence,
+            verbose=verbose, max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+            **generation_kwargs,
+        ):
+            segments.append(segment)
+            wavs.append(chunk)
+
+        wav = torch.cat(wavs, dim=1)
 
         # save audio
         wav = wav.cpu()  # to cpu

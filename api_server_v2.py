@@ -4,7 +4,7 @@ import base64
 import io
 import traceback
 from fastapi import FastAPI, Request, Response, File, UploadFile, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -69,6 +69,77 @@ async def health_check():
             "timestamp": time.time()
         }
     )
+
+
+def _parse_tts_params(data):
+    """Shared request parsing for the synthesis endpoints (mirrors /tts_url)."""
+    emo_control_method = data.get("emo_control_method", 0)
+    if type(emo_control_method) is not int:
+        emo_control_method = emo_control_method.value
+
+    emo_ref_path = data.get("emo_ref_path", None)
+    emo_weight = data.get("emo_weight", 1.0)
+
+    if emo_control_method == 0:
+        emo_ref_path = None
+        emo_weight = 1.0
+
+    if emo_control_method == 2:
+        vec = data.get("emo_vec", [0] * 8)
+        if sum(vec) > 1.5:
+            raise ValueError("情感向量之和不能超过1.5，请调整后重试。")
+    else:
+        vec = None
+
+    return dict(
+        spk_audio_prompt=data["spk_audio_path"],
+        text=data["text"],
+        emo_audio_prompt=emo_ref_path,
+        emo_alpha=emo_weight,
+        emo_vector=vec,
+        use_emo_text=(emo_control_method == 3),
+        emo_text=data.get("emo_text", None),
+        use_random=data.get("emo_random", False),
+        max_text_tokens_per_sentence=int(data.get("max_text_tokens_per_sentence", 120)),
+    )
+
+
+@app.post("/tts_stream")
+async def tts_api_stream(request: Request):
+    """Stream synthesis as NDJSON: one line per finished sentence chunk
+
+        {"text", "start", "end", "sampling_rate", "audio": "<b64 standalone wav>"}
+
+    followed by a final {"done": true} line ({"error": "..."} on mid-stream
+    failure). Chunks include the inter-sentence silence, so decoding and
+    concatenating all chunks reproduces the /tts_url output exactly. The first
+    line arrives as soon as the first sentence is synthesized, while later
+    sentences are still decoding.
+    """
+    try:
+        data = await request.json()
+        params = _parse_tts_params(data)
+    except Exception as ex:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "error": str(ex)},
+        )
+
+    async def ndjson():
+        try:
+            async for segment, sr, chunk in tts.infer_stream(**params):
+                wav_data = chunk.numpy().astype("int16").T
+                with io.BytesIO() as wav_buffer:
+                    sf.write(wav_buffer, wav_data, sr, format="WAV")
+                    audio_b64 = base64.b64encode(wav_buffer.getvalue()).decode("ascii")
+                yield json.dumps({**segment, "sampling_rate": sr, "audio": audio_b64}) + "\n"
+            yield json.dumps({"done": True}) + "\n"
+        except Exception as ex:
+            tb_str = ''.join(traceback.format_exception(type(ex), ex, ex.__traceback__))
+            logger.error(f"tts_stream failed: {tb_str}")
+            yield json.dumps({"error": str(ex)}) + "\n"
+
+    return StreamingResponse(ndjson(), media_type="application/x-ndjson")
 
 
 @app.post("/tts_url", responses={
