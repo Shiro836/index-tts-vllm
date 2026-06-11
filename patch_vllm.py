@@ -45,12 +45,21 @@ def _prepare_inputs(self, scheduler_output, num_scheduled_tokens, *args, **kwarg
         total_num_scheduled_tokens = int(scheduler_output.total_num_scheduled_tokens)
         num_reqs = self.input_batch.num_reqs
 
-        offsets_np = np.empty(num_reqs, dtype=np.int64)
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            req_state = self.requests[req_id]
-            offsets_np[i] = -(req_state.num_prompt_tokens - 1)
+        # per-request offsets are constant for a request's lifetime; rebuild the
+        # GPU tensor only when the batch composition changes, so steady-state
+        # decode does a single indexing kernel with no host->device sync
+        req_ids = tuple(self.input_batch.req_ids[:num_reqs])
+        cached = getattr(self, "_tts_position_offsets", None)
+        if cached is None or cached[0] != req_ids:
+            offsets_np = np.empty(num_reqs, dtype=np.int64)
+            for i, req_id in enumerate(req_ids):
+                req_state = self.requests[req_id]
+                offsets_np[i] = -(req_state.num_prompt_tokens - 1)
+            offsets = torch.from_numpy(offsets_np).to(self.positions.device)
+            self._tts_position_offsets = (req_ids, offsets)
+        else:
+            offsets = cached[1]
 
-        offsets = torch.from_numpy(offsets_np).to(self.positions.device)
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
         self.positions[:total_num_scheduled_tokens].add_(offsets[req_indices_gpu])
 

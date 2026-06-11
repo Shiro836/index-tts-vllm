@@ -18,8 +18,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 #   longer depends on what the other GPU services have already allocated.
 # --qwen_emo_mode lazy: the Qwen emotion engine (~3GB) is only built if an
 #   emo_text request ever arrives (prod has never sent one).
-# --ref_device cpu: w2v-bert + campplus run on CPU, only on speaker-cache
-#   misses (~2.5GB VRAM saved).
+# reference models (w2v-bert, campplus) stay on the GPU: +2.5GB VRAM, but a
+#   new voice costs ~0.3s instead of ~4.5s of CPU inference that also blocks
+#   the event loop. Pass --ref_device cpu to trade back if VRAM gets tight.
 LD_PRELOAD=/home/forsen/repos/index-tts-vllm-fast/fake_dns.so \
     /home/forsen/miniconda3/envs/index-tts-vllm-fast/bin/python api_server_v2.py \
     --host 0.0.0.0 \
@@ -27,4 +28,4 @@ LD_PRELOAD=/home/forsen/repos/index-tts-vllm-fast/fake_dns.so \
     --gpu_memory_utilization 0.10 \
     --kv_cache_memory_bytes 2500000000 \
     --qwen_emo_mode lazy \
-    --ref_device cpu
+    --ref_cache_size 32

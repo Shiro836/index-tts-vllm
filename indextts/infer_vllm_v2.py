@@ -132,9 +132,19 @@ class IndexTTS2:
             engine_kwargs["kv_cache_memory_bytes"] = int(kv_cache_memory_bytes)
         try:
             from vllm.config import CompilationConfig
+            from vllm.config.compilation import CUDAGraphMode
             # decode batch is tiny (concurrent sentences); capturing graphs up to
-            # the default 256 wastes several hundred MB of VRAM
-            engine_kwargs["compilation_config"] = CompilationConfig(cudagraph_capture_sizes=[1, 2, 4, 8, 16])
+            # the default 256 wastes several hundred MB of VRAM.
+            # FULL_AND_PIECEWISE captures whole decode steps as single CUDA graphs —
+            # this 340M model is kernel-launch-bound at bs=1, so eliminating per-step
+            # launches is the main remaining decode speedup (costs a bit more VRAM,
+            # numerically identical).
+            engine_kwargs["compilation_config"] = CompilationConfig(
+                cudagraph_capture_sizes=[1, 2, 4, 8, 16],
+                cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+            )
+            # overlap CPU scheduling of step N+1 with GPU execution of step N
+            engine_kwargs["async_scheduling"] = True
         except Exception:
             logger.warning(">> CompilationConfig unavailable; using default cudagraph capture sizes")
         engine_args = AsyncEngineArgs(**engine_kwargs)

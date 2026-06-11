@@ -33,6 +33,7 @@ async def lifespan(app: FastAPI):
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         qwen_emo_mode=args.qwen_emo_mode,
         ref_device=args.ref_device,
+        ref_cache_size=args.ref_cache_size,
     )
     yield
 
@@ -165,6 +166,8 @@ if __name__ == "__main__":
                         help="When to build the Qwen emotion engine (~3GB VRAM, only used by emo_control_method=3)")
     parser.add_argument("--ref_device", type=str, default=None,
                         help="Device for reference-audio-only models (w2v-bert, campplus), e.g. 'cpu' to save ~2.5GB VRAM")
+    parser.add_argument("--ref_cache_size", type=int, default=8,
+                        help="Number of reference voices whose conditioning stays cached (tens of MB each)")
     args = parser.parse_args()
     
     if not os.path.exists("outputs"):
