@@ -21,6 +21,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # reference models (w2v-bert, campplus) stay on the GPU: +2.5GB VRAM, but a
 #   new voice costs ~0.3s instead of ~4.5s of CPU inference that also blocks
 #   the event loop. Pass --ref_device cpu to trade back if VRAM gets tight.
+# --mel_workers 4: concurrent requests (universal bursts) overlap their
+#   s2mel/vocoder tails instead of queueing behind one thread; activation
+#   VRAM grows per busy worker — drop back to 1 if the card gets tight.
 LD_PRELOAD=/home/forsen/repos/index-tts-vllm-fast/fake_dns.so \
     /home/forsen/miniconda3/envs/index-tts-vllm-fast/bin/python api_server_v2.py \
     --host 0.0.0.0 \
@@ -28,4 +31,5 @@ LD_PRELOAD=/home/forsen/repos/index-tts-vllm-fast/fake_dns.so \
     --gpu_memory_utilization 0.10 \
     --kv_cache_memory_bytes 2500000000 \
     --qwen_emo_mode lazy \
-    --ref_cache_size 32
+    --ref_cache_size 32 \
+    --mel_workers 4

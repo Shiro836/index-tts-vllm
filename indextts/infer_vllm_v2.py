@@ -5,6 +5,7 @@ import re
 import time
 import traceback
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import List
 import uuid
 
@@ -62,7 +63,7 @@ def _half_with_fp32_layernorm(model):
 class IndexTTS2:
     def __init__(
         self, model_dir="checkpoints", is_fp16=False, device=None, use_cuda_kernel=None, gpu_memory_utilization=0.25, qwenemo_gpu_memory_utilization=0.10, offload_device=None,
-        kv_cache_memory_bytes=None, qwen_emo_mode="lazy", ref_device=None, ref_cache_size=8,
+        kv_cache_memory_bytes=None, qwen_emo_mode="lazy", ref_device=None, ref_cache_size=8, mel_workers=1,
     ):
         """
         Args:
@@ -80,6 +81,12 @@ class IndexTTS2:
                 E.g. "cpu" keeps ~2.5GB off the GPU; with the reference cache the forward only
                 runs once per new speaker.
             ref_cache_size (int): number of reference audio files whose conditioning is kept cached.
+            mel_workers (int): threads running the synchronous GPU tail of a sentence
+                (GPT forward, s2mel, BigVGAN) and reference computation. Even 1 keeps the
+                event loop responsive (the GIL is released during CUDA ops); more workers
+                let concurrent requests overlap kernel-launch overhead, but all threads
+                share the default CUDA stream (kernels still serialize) and activation
+                VRAM grows per concurrent worker — measure before raising.
         """
         if device is not None:
             self.device = device
@@ -285,6 +292,12 @@ class IndexTTS2:
         self._ref_cache = OrderedDict()
         self._ref_cache_size = ref_cache_size
 
+        # the synchronous GPU sections (sentence tail, reference computation) run
+        # here instead of on the event loop, which otherwise freezes every
+        # concurrent request's stream for the duration of an s2mel/vocoder pass
+        self._mel_executor = ThreadPoolExecutor(max_workers=max(1, mel_workers), thread_name_prefix="mel")
+        self._ref_inflight = {}
+
     async def _ensure_qwen_emo(self):
         if self.qwen_emo is not None:
             return self.qwen_emo
@@ -370,18 +383,31 @@ class IndexTTS2:
             "cond_latent": cond_latent,
         }
 
-    def _get_ref(self, audio_path):
+    async def _get_ref(self, audio_path):
         key = self._ref_cache_key(audio_path)
         entry = self._ref_cache.get(key)
-        if entry is None:
-            stt = time.perf_counter()
-            entry = self._compute_ref(audio_path)
-            self._ref_cache[key] = entry
-            while len(self._ref_cache) > self._ref_cache_size:
-                self._ref_cache.popitem(last=False)
-            logger.info(f">> reference cache miss for {audio_path} (computed in {time.perf_counter() - stt:.2f}s)")
-        else:
+        if entry is not None:
             self._ref_cache.move_to_end(key)
+            return entry
+
+        # concurrent misses for the same voice compute once; the rest await the
+        # same future instead of duplicating ~0.3s of GPU work per request
+        fut = self._ref_inflight.get(key)
+        if fut is not None:
+            return await fut
+
+        stt = time.perf_counter()
+        fut = asyncio.get_running_loop().run_in_executor(self._mel_executor, self._compute_ref, audio_path)
+        self._ref_inflight[key] = fut
+        try:
+            entry = await fut
+        finally:
+            self._ref_inflight.pop(key, None)
+
+        self._ref_cache[key] = entry
+        while len(self._ref_cache) > self._ref_cache_size:
+            self._ref_cache.popitem(last=False)
+        logger.info(f">> reference cache miss for {audio_path} (computed in {time.perf_counter() - stt:.2f}s)")
         return entry
 
     def insert_interval_silence(self, wavs, sampling_rate=22050, interval_silence=200):
@@ -407,6 +433,91 @@ class IndexTTS2:
 
         return wavs_list
     
+    def _sentence_to_wav(self, codes, text_tokens, speech_conditioning_latent,
+                         spk_cond_emb, emo_cond_emb_gpt, cond_lengths, emo_cond_lengths,
+                         emovec, prompt_condition, ref_mel, style, verbose=False):
+        """GPU tail of one sentence: GPT forward, s2mel diffusion, BigVGAN.
+
+        Runs on the mel executor — the block has no await points, so inline it
+        would pin the event loop for the whole pass. All inputs and outputs are
+        per-sentence locals and the shared modules are pure forwards, so
+        concurrent invocations from different requests are safe; they share the
+        default CUDA stream, so GPU kernels serialize while the loop stays free
+        (the GIL is released during CUDA ops).
+
+        Returns (wav_cpu, gpt_forward_dt, s2mel_dt, bigvgan_dt).
+        """
+        with torch.no_grad():
+            code_lens = []
+            for code in codes:
+                if self.stop_mel_token not in code:
+                    code_len = len(code)
+                else:
+                    len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
+                    code_len = len_ - 1
+                code_lens.append(code_len)
+            codes = codes[:, :code_len]
+            code_lens = torch.LongTensor(code_lens)
+            code_lens = code_lens.to(self.device)
+            if verbose:
+                print(codes, type(codes))
+                print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
+                print(f"code len: {code_lens}")
+
+            m_start_time = time.perf_counter()
+            use_speed = torch.zeros(spk_cond_emb.size(0)).to(self.gpt_device).long()
+            latent = self.gpt(
+                speech_conditioning_latent,
+                text_tokens,
+                torch.tensor([text_tokens.shape[-1]], device=self.gpt_device),
+                codes,
+                torch.tensor([codes.shape[-1]], device=self.gpt_device),
+                emo_cond_emb_gpt,
+                cond_mel_lengths=cond_lengths,
+                emo_cond_mel_lengths=emo_cond_lengths,
+                emo_vec=emovec,
+                use_speed=use_speed,
+            )
+            gpt_forward_dt = time.perf_counter() - m_start_time
+
+            latent = latent.to(self.device)
+            codes = codes.to(self.device)
+
+            with torch.amp.autocast(self.device.split(":")[0] if isinstance(self.device, str) else self.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+                m_start_time = time.perf_counter()
+                diffusion_steps = 25
+                inference_cfg_rate = 0.7
+                latent = self.s2mel.models['gpt_layer'](latent)
+                S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
+                S_infer = S_infer.transpose(1, 2)
+                S_infer = S_infer + latent
+                target_lengths = (code_lens * 1.72).long()
+
+                cond = self.s2mel.models['length_regulator'](S_infer,
+                                                             ylens=target_lengths,
+                                                             n_quantizers=3,
+                                                             f0=None)[0]
+                cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                vc_target = self.s2mel.models['cfm'].inference(cat_condition,
+                                                               torch.LongTensor([cat_condition.size(1)]).to(
+                                                                   cond.device),
+                                                               ref_mel, style, None, diffusion_steps,
+                                                               inference_cfg_rate=inference_cfg_rate)
+                vc_target = vc_target[:, :, ref_mel.size(-1):]
+                s2mel_dt = time.perf_counter() - m_start_time
+
+                m_start_time = time.perf_counter()
+                wav = self.bigvgan(vc_target).squeeze().unsqueeze(0)
+                bigvgan_dt = time.perf_counter() - m_start_time
+                wav = wav.squeeze(1)
+
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            if verbose:
+                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+            wav = wav.cpu()
+
+        return wav, gpt_forward_dt, s2mel_dt, bigvgan_dt
+
     async def infer_stream(self, spk_audio_prompt, text,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
@@ -451,7 +562,7 @@ class IndexTTS2:
             emo_alpha = 1.0
             # assert emo_alpha == 1.0
 
-        spk_ref = self._get_ref(spk_audio_prompt)
+        spk_ref = await self._get_ref(spk_audio_prompt)
         spk_cond_emb = spk_ref["spk_cond_emb"]
         spk_cond_emb_gpt = spk_ref["spk_cond_emb_gpt"]
         prompt_condition = spk_ref["prompt_condition"]
@@ -473,7 +584,7 @@ class IndexTTS2:
 
         # the emo reference defaults to the speaker wav, in which case the speaker
         # entry is reused instead of running w2v-bert a second time on the same audio
-        emo_ref = spk_ref if emo_audio_prompt == spk_audio_prompt else self._get_ref(emo_audio_prompt)
+        emo_ref = spk_ref if emo_audio_prompt == spk_audio_prompt else await self._get_ref(emo_audio_prompt)
         emo_cond_emb = emo_ref["spk_cond_emb"]
         emo_cond_emb_gpt = emo_ref["spk_cond_emb_gpt"]
 
@@ -544,74 +655,16 @@ class IndexTTS2:
                 codes, speech_conditioning_latent = await gen_task
                 gpt_gen_time += time.perf_counter() - m_start_time
 
-                with torch.no_grad():
-                    code_lens = []
-                    for code in codes:
-                        if self.stop_mel_token not in code:
-                            code_len = len(code)
-                        else:
-                            len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
-                            code_len = len_ - 1
-                        code_lens.append(code_len)
-                    codes = codes[:, :code_len]
-                    code_lens = torch.LongTensor(code_lens)
-                    code_lens = code_lens.to(self.device)
-                    if verbose:
-                        print(codes, type(codes))
-                        print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
-                        print(f"code len: {code_lens}")
-
-                    m_start_time = time.perf_counter()
-                    use_speed = torch.zeros(spk_cond_emb.size(0)).to(self.gpt_device).long()
-                    latent = self.gpt(
-                        speech_conditioning_latent,
-                        text_tokens,
-                        torch.tensor([text_tokens.shape[-1]], device=self.gpt_device),
-                        codes,
-                        torch.tensor([codes.shape[-1]], device=self.gpt_device),
-                        emo_cond_emb_gpt,
-                        cond_mel_lengths=cond_lengths,
-                        emo_cond_mel_lengths=emo_cond_lengths,
-                        emo_vec=emovec,
-                        use_speed=use_speed,
-                    )
-                    gpt_forward_time += time.perf_counter() - m_start_time
-
-                    latent = latent.to(self.device)
-                    codes = codes.to(self.device)
-
-                    with torch.amp.autocast(self.device.split(":")[0] if isinstance(self.device, str) else self.device.type, enabled=self.dtype is not None, dtype=self.dtype):
-                        m_start_time = time.perf_counter()
-                        diffusion_steps = 25
-                        inference_cfg_rate = 0.7
-                        latent = self.s2mel.models['gpt_layer'](latent)
-                        S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
-                        S_infer = S_infer.transpose(1, 2)
-                        S_infer = S_infer + latent
-                        target_lengths = (code_lens * 1.72).long()
-
-                        cond = self.s2mel.models['length_regulator'](S_infer,
-                                                                     ylens=target_lengths,
-                                                                     n_quantizers=3,
-                                                                     f0=None)[0]
-                        cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                        vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                                       torch.LongTensor([cat_condition.size(1)]).to(
-                                                                           cond.device),
-                                                                       ref_mel, style, None, diffusion_steps,
-                                                                       inference_cfg_rate=inference_cfg_rate)
-                        vc_target = vc_target[:, :, ref_mel.size(-1):]
-                        s2mel_time += time.perf_counter() - m_start_time
-
-                        m_start_time = time.perf_counter()
-                        wav = self.bigvgan(vc_target).squeeze().unsqueeze(0)
-                        bigvgan_time += time.perf_counter() - m_start_time
-                        wav = wav.squeeze(1)
-
-                    wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-                    if verbose:
-                        print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-                    wav = wav.cpu()
+                wav, fwd_dt, mel_dt, voc_dt = await asyncio.get_running_loop().run_in_executor(
+                    self._mel_executor,
+                    self._sentence_to_wav,
+                    codes, text_tokens, speech_conditioning_latent,
+                    spk_cond_emb, emo_cond_emb_gpt, cond_lengths, emo_cond_lengths,
+                    emovec, prompt_condition, ref_mel, style, verbose,
+                )
+                gpt_forward_time += fwd_dt
+                s2mel_time += mel_dt
+                bigvgan_time += voc_dt
 
                 n = wav.shape[-1]
                 segment = {

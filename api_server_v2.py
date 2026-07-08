@@ -34,6 +34,7 @@ async def lifespan(app: FastAPI):
         qwen_emo_mode=args.qwen_emo_mode,
         ref_device=args.ref_device,
         ref_cache_size=args.ref_cache_size,
+        mel_workers=args.mel_workers,
     )
     yield
 
@@ -239,6 +240,8 @@ if __name__ == "__main__":
                         help="Device for reference-audio-only models (w2v-bert, campplus), e.g. 'cpu' to save ~2.5GB VRAM")
     parser.add_argument("--ref_cache_size", type=int, default=8,
                         help="Number of reference voices whose conditioning stays cached (tens of MB each)")
+    parser.add_argument("--mel_workers", type=int, default=1,
+                        help="Threads for the synchronous GPU tail (GPT forward/s2mel/BigVGAN); 1 already keeps the event loop responsive, >1 overlaps concurrent requests at the cost of activation VRAM per worker")
     args = parser.parse_args()
     
     if not os.path.exists("outputs"):
