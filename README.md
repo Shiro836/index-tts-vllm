@@ -1,3 +1,14 @@
+> **This fork** ([Shiro836/index-tts-vllm](https://github.com/Shiro836/index-tts-vllm)) runs as the production TTS engine of a Twitch-overlay service and diverges from upstream. Changes on top of upstream:
+>
+> - Ported to vLLM 0.22.1 (v1 `AsyncLLM` engine); GPT decode tuned with full CUDA-graph capture and async scheduling
+> - **`/tts_stream`** — NDJSON streaming endpoint: one standalone WAV chunk per sentence, first audio as soon as the first sentence is synthesized, client disconnect cancels the remaining vLLM decodes
+> - Sentence-level time marks: `return_segments` on `/tts_url`; `start`/`end` inline on every stream chunk
+> - Per-voice reference-conditioning LRU cache (keyed on path + mtime + size), request-invariant conditioning hoisted out of the sentence loop
+> - Synchronous GPU sections (GPT forward, s2mel diffusion, BigVGAN, reference computation) run on a worker pool (`--mel_workers`) instead of the event loop, so concurrent requests no longer stall each other — addresses upstream's "V2 api concurrency" TODO
+> - Ops: explicit KV-cache budget (`--kv_cache_memory_bytes`) for deterministic boot next to other GPU services, lazy Qwen emotion engine (`--qwen_emo_mode`), `--ref_device`, hardened systemd units for side-by-side deployment
+>
+> Upstream docs continue below; English version: [README_EN.md](README_EN.md).
+
 <a href="README.md">中文</a> ｜ <a href="README_EN.md">English</a>
 
 <div align="center">
