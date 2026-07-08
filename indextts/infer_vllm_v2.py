@@ -588,13 +588,11 @@ class IndexTTS2:
         emo_cond_emb = emo_ref["spk_cond_emb"]
         emo_cond_emb_gpt = emo_ref["spk_cond_emb_gpt"]
 
-        text_tokens_list = self.tokenizer.tokenize(text)
-        sentences = self.tokenizer.split_sentences(text_tokens_list, max_text_tokens_per_sentence)
+        sentence_pairs = self.tokenizer.split_text_with_originals(text, max_text_tokens_per_sentence)
         if verbose:
-            print("text_tokens_list:", text_tokens_list)
-            print("sentences count:", len(sentences))
+            print("sentences count:", len(sentence_pairs))
             print("max_text_tokens_per_sentence:", max_text_tokens_per_sentence)
-            print(*sentences, sep="\n")
+            print(*sentence_pairs, sep="\n")
 
         sampling_rate = 22050
 
@@ -626,10 +624,10 @@ class IndexTTS2:
         # with the decodes still in flight.
         sent_text_tokens = []
         sent_texts = []
-        for sent in sentences:
-            token_ids = self.tokenizer.convert_tokens_to_ids(sent)
+        for orig_text, sent_tokens in sentence_pairs:
+            token_ids = self.tokenizer.convert_tokens_to_ids(sent_tokens)
             sent_text_tokens.append(torch.tensor(token_ids, dtype=torch.int32, device=self.gpt_device).unsqueeze(0))
-            sent_texts.append(self.tokenizer.decode(token_ids).strip())
+            sent_texts.append(orig_text)
 
         gen_tasks = [
             asyncio.create_task(self.gpt.inference_speech(

@@ -2,7 +2,7 @@
 import os
 import traceback
 import re
-from typing import List, Union, overload
+from typing import List, Tuple, Union, overload
 import warnings
 from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
 from sentencepiece import SentencePieceProcessor
@@ -426,6 +426,69 @@ class TextTokenizer:
         return TextTokenizer.split_sentences_by_token(
             tokenized, self.punctuation_marks_tokens, max_tokens_per_sentence=max_tokens_per_sentence
         )
+
+    # sentence end: terminal punctuation, optionally followed by closing quotes or
+    # brackets, and only when followed by whitespace or end-of-text — so "3.5",
+    # "Dr.Smith" or a URL never split mid-token
+    _SENTENCE_END_RE = re.compile(r'[.!?…]+["\')\]]*(?=\s|$)')
+    _COMMA_SPLIT_RE = re.compile(r',(?=\s)')
+
+    def _split_original_sentences(self, text: str) -> List[str]:
+        sentences = []
+        start = 0
+        for m in self._SENTENCE_END_RE.finditer(text):
+            chunk = text[start:m.end()].strip()
+            if chunk:
+                sentences.append(chunk)
+            start = m.end()
+        tail = text[start:].strip()
+        if tail:
+            sentences.append(tail)
+        return sentences
+
+    def split_text_with_originals(self, text: str, max_tokens_per_sentence=120) -> List[Tuple[str, List[str]]]:
+        """Split text into synthesis chunks like split_sentences (sentence
+        boundaries, comma fallback for overlong sentences, short-neighbor
+        merging), but keep each chunk's ORIGINAL substring alongside its tokens.
+
+        Normalization is not offset-preserving (case, numbers and punctuation
+        all change), so a chunk's original text is only knowable by splitting
+        before tokenizing. Returns a list of (original_text, tokens) pairs.
+        """
+        pieces: List[Tuple[str, List[str]]] = []
+
+        def add(orig: str):
+            tokens = self.tokenize(orig)
+            if not tokens:
+                return
+            if len(tokens) <= max_tokens_per_sentence:
+                pieces.append((orig, tokens))
+                return
+            # hard fallback for a fragment that exceeds the limit even after the
+            # comma pass: token-length split; the original substring of such a
+            # fragment is unknown, so its display text degrades to the decoded
+            # (normalized) form — same as the pre-original-text behavior
+            for j in range(0, len(tokens), max_tokens_per_sentence):
+                frag = tokens[j:j + max_tokens_per_sentence]
+                pieces.append((self.decode(self.convert_tokens_to_ids(frag)).strip(), frag))
+
+        for sent in self._split_original_sentences(text):
+            if len(self.tokenize(sent)) <= max_tokens_per_sentence:
+                add(sent)
+            else:
+                for part in self._COMMA_SPLIT_RE.split(sent):
+                    part = part.strip()
+                    if part:
+                        add(part)
+
+        merged: List[Tuple[str, List[str]]] = []
+        for orig, tokens in pieces:
+            if merged and len(merged[-1][1]) + len(tokens) <= max_tokens_per_sentence:
+                prev_orig, prev_tokens = merged[-1]
+                merged[-1] = (prev_orig + " " + orig, prev_tokens + tokens)
+            else:
+                merged.append((orig, tokens))
+        return merged
 
 
 if __name__ == "__main__":
